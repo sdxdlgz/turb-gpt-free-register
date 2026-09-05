@@ -187,6 +187,27 @@ def _account_secret_value(row: dict, field: str) -> str:
     raise ValueError("field 仅支持 access_token/copy_line/codex_agent_token/totp_secret/totp_code/password")
 
 
+def _account_password(row: dict) -> str:
+    """取账号的 OpenAI 登录密码。优先 Outlook 池 password，否则读 extra.registration_password。"""
+    pwd = str(row.get("password") or "").strip()
+    if pwd and pwd != "未设置":
+        return pwd
+    try:
+        return _account_secret_value(row, "password")
+    except Exception:
+        return ""
+
+
+def _account_reauth_line(row: dict) -> str:
+    """生成 codex-auth-web 可用的重授权行：邮箱----OpenAI密码----2FA(TOTP)。"""
+    email = str(row.get("email") or "").strip()
+    pwd = _account_password(row)
+    if pwd == "未设置":
+        pwd = ""
+    totp = str(row.get("totp_secret") or "").strip()
+    return "----".join([email, pwd, totp])
+
+
 def _compact_job_for_list(row: dict) -> dict:
     """注册任务列表轻量对象：只返回表格展示和按钮判断需要的字段。"""
     out = {
@@ -486,6 +507,50 @@ def create_app(auth_code: str | None = None) -> Flask:
             else:
                 skipped.append({"id": acc_id, "email": acc.get("email"), "reason": "值为空"})
         return jsonify({"ok": True, "field": field, "values": values, "count": len(values), "skipped": skipped})
+
+    @app.route("/api/accounts/export-reauth", methods=["GET", "POST"])
+    def api_accounts_export_reauth():
+        """导出 codex-auth-web 可用的重授权行：邮箱----OpenAI密码----2FA(TOTP)。
+
+        GET：全部；POST：{account_ids:[...]}；?format=json 返回数组。
+        """
+        data = request.get_json(silent=True) if request.method == "POST" else None
+        data = data or {}
+        ids = data.get("account_ids") or data.get("ids") or []
+        if isinstance(ids, str):
+            ids = [x.strip() for x in ids.replace(";", ",").split(",") if x.strip()]
+        fmt = str(request.args.get("format") or (data.get("format") or "")).strip().lower()
+
+        if ids:
+            rows = []
+            seen = set()
+            for raw in ids:
+                try:
+                    acc_id = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if acc_id in seen:
+                    continue
+                seen.add(acc_id)
+                acc = db.get_account(acc_id)
+                if acc:
+                    rows.append(acc)
+        else:
+            limit = max(1, min(20000, int(request.args.get("limit", default=20000, type=int))))
+            rows = db.list_accounts(limit=limit, archived=str(request.args.get("archived", default="0") or "0").lower())
+
+        rows = [r for r in rows if str(r.get("email") or "").strip()]
+        if fmt == "json":
+            payload = [{"email": str(r.get("email") or ""), "password": _account_password(r), "totp_secret": str(r.get("totp_secret") or "")} for r in rows]
+            return jsonify({"ok": True, "count": len(payload), "credentials": payload})
+
+        text = "\n".join(_account_reauth_line(r) for r in rows) + ("\n" if rows else "")
+        from datetime import datetime as _dt
+        return Response(
+            text,
+            mimetype="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="reauth-{_dt.now().strftime("%Y%m%d-%H%M%S")}.txt"'},
+        )
 
     @app.post("/api/accounts/<int:acc_id>/archive")
     def api_account_archive(acc_id: int):

@@ -31,6 +31,14 @@ logger = logging.getLogger(__name__)
 _LOG_CONTEXT = threading.local()
 
 
+class CodexRestartNeeded(RuntimeError):
+    """需要作废当前授权、重新从 CPA/sub2 拿全新链接再走一遍 OAuth。
+
+    触发：手机号已发送成功但一直没收到短信（SmsCodeTimeout），或页面 invalid_auth_step。
+    """
+
+
+
 def _log_provider_label() -> str:
     return str(getattr(_LOG_CONTEXT, "provider_label", "BrowserUse") or "BrowserUse")
 
@@ -1237,6 +1245,22 @@ def _fill_phone(page, phone: str) -> str:
     logger.info("[Codex][BrowserUse] 页面手机号输入值：%r", actual)
 
     _select_sms_channel(page)
+    # 先等 React 稳定再提交：OpenAI add-phone 用 JS 点按钮在远端容易被遮罩/漏点，
+    # 优先回车提交表单；没跳转再用按钮点击兜底。
+    try:
+        time.sleep(0.6)
+    except Exception:
+        pass
+    try:
+        page.keyboard.press("Enter")
+    except Exception:
+        pass
+    try:
+        time.sleep(1.2)
+        if _has_visible_phone_code_input(page) or _is_callback_url(_page_url(page)):
+            return phone_e164
+    except Exception:
+        pass
     if not _click_phone_continue(page):
         try:
             page.keyboard.press("Enter")
@@ -1348,6 +1372,43 @@ def _ensure_add_phone_form(page, *, reason: str = "") -> bool:
     logger.warning("[Codex][BrowserUse] 无法回到手机号输入页：%s", _current_state_for_log(page))
     return False
 
+def _submit_phone_until_sent(page, phone: str, max_tries: int = 3) -> tuple[str, str]:
+    """提交手机号并尽量在同一号码上让它真正发出去。
+
+    远端云浏览器偶发“号码已填但 Continue 没被点到”→ 表单仍说 Phone number required。
+    这里同号清空重填、重新点击多次，提高进入短信页概率，避免白烧接码余额。
+    """
+    phone_e164 = _phone_e164(phone)
+    last_send = "unknown"
+    for try_no in range(1, max_tries + 1):
+        try:
+            phone_e164 = _fill_phone(page, phone)
+        except Exception as exc:
+            raise RuntimeError(f"填写手机号失败(第{try_no}次, 同号重试): {type(exc).__name__}: {str(exc)[:160]}")
+
+        _bu_delay("form")
+        timeout = 10 if (_fast_mode() or try_no < max_tries) else 18
+        last_send = _wait_after_phone_send(page, timeout=timeout)
+
+        if last_send in ("code_page", "callback", "rejected"):
+            return phone_e164, last_send
+
+        logger.warning(
+            "[Codex][BrowserUse] 手机号提交未跳转（第%s次，send_state=%s），同号重填重试",
+            try_no, last_send,
+        )
+        try:
+            _dismiss_phone_country_dropdown(page)
+            _clear_phone_inputs(page)
+            _ensure_add_phone_form(page, reason=f"resubmit-{try_no}")
+        except Exception as exc:
+            logger.info("[Codex][BrowserUse] 同号重试准备失败：%s", str(exc)[:160])
+            break
+        time.sleep(0.8 if _fast_mode() else 1.5)
+
+    return phone_e164, last_send
+
+
 def _do_phone_verification_if_present(page) -> None:
     # 给页面一点时间从邮箱 OTP 后跳到手机号页；没有就跳过。
     end = time.time() + 20
@@ -1377,18 +1438,22 @@ def _do_phone_verification_if_present(page) -> None:
             activation_id, phone = sms_provider.acquire_number(http)
             logger.info("[Codex][BrowserUse] 已取号：%s activation=%s", phone, activation_id)
             _t_phone_send = _StepTimer(f"填写并提交手机号 attempt={attempt}")
-            phone_e164 = _fill_phone(page, phone)
-            _bu_delay("form")
-            send_state = _wait_after_phone_send(page, timeout=12 if _fast_mode() else 18)
+            phone_e164, send_state = _submit_phone_until_sent(page, phone)
             _t_phone_send.done(f"state={send_state}")
             logger.info("[Codex][BrowserUse] 手机号提交后状态：%s phone=%s", send_state, phone_e164)
             if send_state == "callback":
                 return
+            if send_state == "rejected":
+                # invalid_auth_step 等硬错误：当前 auth 会话已坏，必须整体重启。
+                raise CodexRestartNeeded("手机号提交被拒/页面 invalid_auth_step，需要重新授权再试")
             if send_state != "code_page":
                 raise RuntimeError(f"提交手机号后未确认发送短信/进入验证码页：state={send_state}, page={_current_state_for_log(page)}")
             sms_provider.set_status(activation_id, 1, http=http)
             _t_sms = _StepTimer(f"等待手机短信 attempt={attempt}")
-            sms_code = sms_provider.wait_for_sms_code(activation_id, http)
+            try:
+                sms_code = sms_provider.wait_for_sms_code(activation_id, http)
+            except sms_provider.SmsCodeTimeout as exc:
+                raise CodexRestartNeeded(f"手机号已发送但未收到短信，需要重新授权再试（{exc}）") from exc
             _t_sms.done()
             logger.info("[Codex][BrowserUse] 手机 OTP 收到：%s", sms_code)
             _clear_otp_inputs(page)
@@ -1405,6 +1470,8 @@ def _do_phone_verification_if_present(page) -> None:
                 sms_provider.complete(activation_id, http)
                 return
             raise RuntimeError(f"手机验证码未通过：{outcome}")
+        except CodexRestartNeeded:
+            raise
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {str(exc)[:220]}"
             logger.warning("[Codex][BrowserUse] 手机验证失败（%s/%s）：%s", attempt, max_retries, last_error)
@@ -1580,6 +1647,9 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
             path = proto._save_codex_credential(email, storage)
             _t_all.done("success")
             return proto._codex_result(status="success", ok=True, email=email, file_path=str(path), callback_url=callback_url)
+    except CodexRestartNeeded:
+        # 手机已发没短信 / invalid_auth_step：交给上层重启一轮全新授权
+        raise
     except AccountUnusableError as exc:
         logger.warning("[Codex][BrowserUse] 账号已废：%s，%s", email, exc.error_code)
         return proto._codex_result(
@@ -1652,31 +1722,39 @@ def _run_in_isolated_thread(fn, *args, **kwargs):
 
 
 def _run_browser_use_codex_oauth_impl(email: str, otp_provider=None, proxy: str | None = None, force: bool = False, cloud_provider: str = "browser_use") -> dict:
-    """Browser Use Codex OAuth 入口；CPA callback 409 timeout 时重新开启一轮授权。"""
+    """Browser Use Codex OAuth 入口；可自动重启（CPA 409 / 手机已发没短信 / invalid_auth_step）。"""
     from core import codex_oauth as proto
 
-    max_rounds = 2
+    max_rounds = 3
     last_result = None
+    restart_reason = ""
     for round_no in range(1, max_rounds + 1):
         if round_no > 1:
             logger.warning(
-                "[Codex][BrowserUse] CPA callback 返回 Timeout waiting for OAuth callback，重新开启第 %s/%s 轮 Codex 授权：%s",
+                "[Codex][BrowserUse] %s，重新开启第 %s/%s 轮全新 Codex 授权（新链接+新会话）：%s",
+                restart_reason or "上一轮未完成",
                 round_no,
                 max_rounds,
                 email,
             )
-        result = _run_browser_use_codex_oauth_once(email=email, otp_provider=otp_provider, proxy=proxy, force=force, cloud_provider=cloud_provider)
+        try:
+            result = _run_browser_use_codex_oauth_once(email=email, otp_provider=otp_provider, proxy=proxy, force=force, cloud_provider=cloud_provider)
+        except CodexRestartNeeded as exc:
+            restart_reason = str(exc)[:120]
+            last_result = proto._codex_result(status="failed", email=email, message=restart_reason)
+            continue
         last_result = result
         if result.get("ok"):
             return result
         msg = result.get("message") or result.get("error") or ""
         if not proto._is_cpa_callback_reauth_error(msg):
             return result
+        restart_reason = "CPA callback 返回 Timeout waiting for OAuth callback"
     if last_result:
         last_result = dict(last_result)
-        last_result["message"] = f"CPA callback 超时，已重新授权 {max_rounds} 轮仍失败：{last_result.get('message') or ''}"
+        last_result["message"] = f"已重新授权 {max_rounds} 轮仍失败：{restart_reason or last_result.get('message') or ''}"
         return last_result
-    return proto._codex_result(status="failed", email=email, message="CPA callback 超时，重新授权失败")
+    return proto._codex_result(status="failed", email=email, message="重新授权失败")
 
 
 def run_browser_use_codex_oauth(email: str, otp_provider=None, proxy: str | None = None, force: bool = False, cloud_provider: str = "browser_use") -> dict:

@@ -18,6 +18,7 @@
 """
 import json
 import logging
+import re
 import threading
 import time
 from urllib.parse import urljoin
@@ -67,16 +68,14 @@ def _provider() -> str:
 
 
 def _request_grizzly(http: CurlSession, params: dict) -> str:
-    """
-    发一个 GrizzlySMS API 请求，返回去空白的响应文本。
-    统一识别公共错误码并抛对应异常。
-    """
+    """发一个 SMS-Activate 兼容 API 请求（GrizzlySMS / SMSBower 等），返回去空白的响应文本。"""
+    provider_label = "SMSBower" if _provider() == "smsbower" else "GrizzlySMS"
     base_params = {"api_key": _cfg.SMS_API_KEY}
     base_params.update(params)
     resp = http.get(_cfg.SMS_API_BASE, params=base_params)
     if resp.status_code != 200:
         raise SmsProviderError(
-            f"GrizzlySMS HTTP {resp.status_code}: {(resp.text or '')[:200]}"
+            f"{provider_label} HTTP {resp.status_code}: {(resp.text or '')[:200]}"
         )
     text = (resp.text or "").strip()
 
@@ -97,6 +96,121 @@ def _request_grizzly(http: CurlSession, params: dict) -> str:
         raise SmsProviderError(f"该服务被平台禁售：{text}")
 
     return text
+
+
+def _request_grizzly_json(http: CurlSession, params: dict) -> dict:
+    """调用 SMS-Activate 兼容平台返回 JSON 的接口（getCountries / getTopCountriesByService / getPrices*）。"""
+    provider_label = "SMSBower" if _provider() == "smsbower" else "GrizzlySMS"
+    base_params = {"api_key": _cfg.SMS_API_KEY}
+    base_params.update(params)
+    resp = http.get(_cfg.SMS_API_BASE, params=base_params)
+    if resp.status_code != 200:
+        raise SmsProviderError(
+            f"{provider_label} HTTP {resp.status_code}: {(resp.text or '')[:200]}"
+        )
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        raise SmsProviderError(
+            f"{provider_label} 响应不是 JSON ({params.get('action')}): {(resp.text or '')[:200]}"
+        ) from exc
+    if isinstance(payload, dict):
+        err = payload.get("status") if isinstance(payload.get("status"), str) else None
+        if payload.get("BAD_KEY") or err in ("error", "BAD_KEY", "BAD_SERVICE", "BAD_ACTION"):
+            raise SmsProviderError(f"{provider_label} 自动选号接口错误：{str(payload)[:200]}")
+    return payload
+
+
+def _smooth_country_key(value) -> str:
+    """把国家名归一化成小写字母指纹，兼容 'United States' / 'united-states' / 'USA' 等写法。"""
+    return re.sub(r"[^a-z]", "", str(value or "").strip().lower())
+
+
+def _smsbower_country_id_map(http: CurlSession) -> dict[str, str]:
+    """国家英文名指纹 -> 国家 id，保留原始小写名两个 key（getNumber 用数字 id）。"""
+    mapping: dict[str, str] = {}
+    try:
+        payload = _request_grizzly_json(http, {"action": "getCountries"})
+    except Exception as exc:
+        logger.warning("[SMS] getCountries 拉取失败（自动选号回退固定国家）：%s", str(exc)[:160])
+        return mapping
+
+    items: list = []
+    if isinstance(payload, dict):
+        vals = list(payload.values())
+        if vals and all(isinstance(v, dict) for v in vals):
+            items = vals
+        else:
+            items = payload.get("countries") or payload.get("data") or payload.get("list") or []
+            if not isinstance(items, list) and isinstance(payload.get("data"), list):
+                items = payload.get("data")
+    elif isinstance(payload, list):
+        items = payload
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("eng") or item.get("rus") or item.get("name") or "").strip().lower()
+        cid = str(item.get("id") or "").strip()
+        if not name or not cid:
+            continue
+        mapping[name] = cid
+        mapping[_smooth_country_key(name)] = cid
+    return mapping
+
+
+def _smsbower_pick_cheapest_gold(http: CurlSession) -> tuple[str, str, float] | None:
+    """在 SMSBower gold 级别号码里，按价格上限选最便宜的 (country_id, provider_ids, price)。"""
+    top = _request_grizzly_json(
+        http, {"action": "getTopCountriesByService", "service": _cfg.SMS_SERVICE}
+    )
+    if not isinstance(top, dict):
+        raise SmsProviderError("getTopCountriesByService 响应不是对象，无法自动选号")
+    id_map = _smsbower_country_id_map(http)
+
+    max_price_raw = str(_cfg.SMS_MAX_PRICE or "").strip()
+    try:
+        max_price = float(max_price_raw) if max_price_raw else None
+    except (TypeError, ValueError):
+        max_price = None
+
+    best: tuple[str, str, float] | None = None
+    for cname, providers in top.items():
+        if not isinstance(cname, str) or not isinstance(providers, dict):
+            continue
+        # 虚拟号通常收不到 OpenAI 短信，默认跳过
+        if "virtual" in cname.lower() or "虚拟" in cname:
+            continue
+        cid = id_map.get(cname.strip().lower()) or id_map.get(_smooth_country_key(cname))
+        if not cid:
+            continue
+        for pid, info in providers.items():
+            if not isinstance(pid, str) and not isinstance(pid, int):
+                continue
+            if not isinstance(info, dict):
+                continue
+            try:
+                price = float(info.get("price") or 0)
+                count = int(info.get("count") or 0)
+            except (TypeError, ValueError):
+                continue
+            if count <= 0:
+                continue
+            if max_price is not None and price > max_price:
+                continue
+            if best is None or price < best[2]:
+                best = (cid, str(pid), price)
+
+    if best is None:
+        raise SmsNoNumbersError(
+            "自动选号：当前服务没有符合价格上限的 gold 号码"
+            + (f"（maxPrice={max_price}）" if max_price is not None else "")
+        )
+    logger.info(
+        "[SMS] 自动选号（gold 最低价）：country_id=%s provider_id=%s price=%.4f",
+        best[0], best[1], best[2],
+    )
+    return best
 
 
 def _l_url(path: str) -> str:
@@ -382,11 +496,22 @@ def acquire_number(
             )
             return activation_id, phone
 
-        params = {
-            "action": "getNumber",
-            "service": service or _cfg.SMS_SERVICE,
-            "country": country or _cfg.SMS_COUNTRY,
-        }
+        auto_country = False
+        country_val = str(country or _cfg.SMS_COUNTRY or "").strip()
+        if country_val.lower() in ("auto", "random", "cheapest", "*"):
+            auto_country = True
+
+        params: dict = {"action": "getNumber", "service": service or _cfg.SMS_SERVICE}
+        provider_ids = ""
+        if auto_country:
+            # 随机国家 + gold 级别 + 价格上限里选最低价
+            picked = _smsbower_pick_cheapest_gold(http)
+            if picked:
+                params["country"] = picked[0]
+                provider_ids = picked[1]
+                params["providerIds"] = provider_ids
+        else:
+            params["country"] = country_val or _cfg.SMS_COUNTRY or ""
         if _cfg.SMS_MAX_PRICE:
             params["maxPrice"] = _cfg.SMS_MAX_PRICE
 

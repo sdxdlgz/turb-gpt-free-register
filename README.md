@@ -916,3 +916,32 @@ ROXY_OPEN_HEADLESS = False
 ## License
 
 MIT
+
+
+---
+
+## 🔧 本仓库额外定制（上游没有的自定义改动）
+
+基于上游最新版，额外移植/改进了以下 4 项：
+
+1. **smsbower 接码**（SMS-Activate 兼容）
+   - `SMS_PROVIDER=smsbower`，`SMS_API_BASE=https://smsbower.page/stubs/handler_api.php`
+   - 与 Grizzly 同套 `getNumber/getStatus/setStatus`，`SMS_API_KEY` 走统一配置。
+
+2. **手机号自动选号（gold 最低价）**
+   - `SMS_COUNTRY=auto` 时，通过 `getTopCountriesByService` + `getCountries`，
+     在 `SMS_MAX_PRICE` 内自动选**价格最低的 gold 真实号**（默认跳过虚拟号段），
+     并把 `providerIds` 透传给 `getNumber`。
+
+3. **导出「邮箱----密码----2FA」**
+   - WebUI 账号页「导出密码+2FA」「导出全部(密码+2FA)」按钮；
+   - 接口 `GET/POST /api/accounts/export-reauth`（`?format=json` 可返回数组）；
+   - 每行 `邮箱----OpenAI密码----TOTP_secret`，可直接喂给 codex-auth-web 的“密码+2FA”重授权。
+
+4. **手机验证“已发没短信 → 自动重新授权”**
+   - 同号最多重试 3 次再换号（`_submit_phone_until_sent`）；
+   - 手机号提交改为**先回车**（解决“填了却说 Phone number required”）再按钮兜底；
+   - 出现 `SmsCodeTimeout`（号码已发但没收到短信）或 `invalid_auth_step` 时，
+     作废当前授权，从 CPA/sub2 **重新拿全新授权链接 + 新浏览器会话**重走 OAuth（最多 3 轮）。
+
+> 其余功能（Remail、2FA/TOTP、密码注册、IMAP 邮箱、sqlite 存储等）均为上游原版实现。

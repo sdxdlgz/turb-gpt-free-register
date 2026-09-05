@@ -647,11 +647,19 @@ EDITABLE_FIELDS = [
 
     {
         "key": "SMS_PROVIDER", "file": "codex.py", "type": "str", "group": "接码平台",
-        "label": "接码通道", "help": "grizzly / l / h；l 使用 L_API.md，h 使用 H_API.md 定义的本地取号服务",
+        "label": "接码通道", "help": "grizzly / smsbower / l / h；smsbower 为 SMS-Activate 兼容接口（填 SMS_API_BASE 指向其 handler_api.php），l/h 使用本地取号服务",
     },
     {
         "key": "SMS_COUNTRY", "file": "codex.py", "type": "str", "group": "接码平台",
-        "label": "国家代码", "help": "传给接码平台的 country；GrizzlySMS 常用：美国=187；H 通道作为 H_API.md 的 country",
+        "label": "国家代码", "help": "传给接码平台的 country；GrizzlySMS 常用：美国=187；填 auto/random 表示自动选价格最低的 gold 号；H 通道作为 H_API.md 的 country",
+    },
+    {
+        "key": "SMS_API_BASE", "file": "codex.py", "type": "str", "group": "接码平台",
+        "label": "接码 API 地址", "help": "SMS-Activate 兼容接口地址；SMSBower 可填 https://smsbower.page/stubs/handler_api.php",
+    },
+    {
+        "key": "SMS_MAX_PRICE", "file": "codex.py", "type": "str", "group": "接码平台",
+        "label": "最高单价上限", "help": "传给 getNumber 的 maxPrice，例如 0.05；留空不限制",
     },
     {
         "key": "SMS_SERVICE", "file": "codex.py", "type": "str", "group": "接码平台",

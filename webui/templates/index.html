@@ -2258,6 +2258,7 @@
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedTokensV2" disabled title="复制选中账号的 Token，每个账号一行">复制Token</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedEmailsV2" disabled title="复制选中账号的邮箱，每个账号一行">复制邮箱</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedTxtV2" disabled title="把选中账号的完整整行保存为 TXT 文件，每个账号一行">下载TXT</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportReauthSelectedV2" disabled title="导出选中账号的重授权行：邮箱----OpenAI密码----2FA(TOTP)，可用于 codex-auth-web">导出密码+2FA</button>
           <button type="button" class="jobs-tb-btn" id="btnArchiveSelectedAccountsV2" disabled title="归档选中的账号；默认账号列表将不再查询/显示这些账号">归档选中</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnDeleteSelectedAccountsV2" disabled title="删除选中的本地账号/token记录">删除</button>
         </div>
@@ -2265,6 +2266,7 @@
           <span class="acc-v2-btn-group-title">全部</span>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCopyAllTokensV2" title="复制当前页所有 Token，每个账号一行">复制Token</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopyAllLinesV2" title="复制当前页所有账号整行，每个账号一行">复制整行</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportReauthAllV2" title="导出当前页全部账号的邮箱----OpenAI密码----2FA，可用于 codex-auth-web">导出全部(密码+2FA)</button>
         </div>
       </div>
       <div class="accounts-table-v2-wrap">
@@ -3621,7 +3623,7 @@ function updateAccountSelectionUi(pageRows = null) {
     'btnCheckSelectedPlansV2', 'btnExtractSelectedLinksV2',
     'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
     'btnSetupSelectedTotpV2', 'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2', 'btnCopySelectedTokensV2', 'btnCopySelectedEmailsV2',
-    'btnDownloadSelectedTxtV2', 'btnArchiveSelectedAccountsV2', 'btnDeleteSelectedAccountsV2',
+    'btnDownloadSelectedTxtV2', 'btnExportReauthSelectedV2', 'btnArchiveSelectedAccountsV2', 'btnDeleteSelectedAccountsV2',
   ];
   v2Ids.forEach(id => {
     const el = document.getElementById(id);
@@ -4378,6 +4380,45 @@ async function downloadSelectedAccountTxt() {
   showToast(`已下载 ${lines.length} 个账号 TXT`);
 }
 
+function downloadTextFile(text, filename) {
+  const blob = new Blob(['\ufeff' + text], {type: 'text/plain;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 800);
+}
+
+async function exportSelectedReauth() {
+  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
+  if (!ids.length) { showToast('请先选择账号'); return; }
+  try {
+    const resp = await fetch('/api/accounts/export-reauth', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({account_ids: ids}),
+    });
+    if (!resp.ok) { const e = await resp.json().catch(() => ({})); showToast('导出失败: ' + (e.error || resp.status)); return; }
+    const text = await resp.text();
+    if (!text.trim()) { showToast('选中账号没有可导出的密码/2FA'); return; }
+    downloadTextFile(text, `reauth-selected-${Date.now()}.txt`);
+    showToast(`已导出 ${text.trim().split('\n').length} 条重授权`);
+  } catch(err) { showToast('导出失败: ' + err.message); }
+}
+
+async function exportAllReauth() {
+  try {
+    const resp = await fetch('/api/accounts/export-reauth?limit=20000');
+    if (!resp.ok) { const e = await resp.json().catch(() => ({})); showToast('导出失败: ' + (e.error || resp.status)); return; }
+    const text = await resp.text();
+    if (!text.trim()) { showToast('当前页没有可导出的密码/2FA'); return; }
+    downloadTextFile(text, `reauth-all-${Date.now()}.txt`);
+    showToast(`已导出 ${text.trim().split('\n').length} 条重授权`);
+  } catch(err) { showToast('导出失败: ' + err.message); }
+}
+
 async function downloadSelectedCpa() {
   const ids = Array.from(ACCOUNT_SELECTED);
   if (ids.length === 0) { showToast('请先选择账号'); return; }
@@ -4950,6 +4991,8 @@ async function copyCurrentPageLines() {
   bind('btnCopyAllTokensV2', copyCurrentPageTokens);
   bind('btnCopyAllLinesV2', copyCurrentPageLines);
   bind('btnDownloadSelectedTxtV2', downloadSelectedAccountTxt);
+  bind('btnExportReauthSelectedV2', exportSelectedReauth);
+  bind('btnExportReauthAllV2', exportAllReauth);
   bind('btnArchiveSelectedAccountsV2', archiveSelectedAccounts);
   bind('btnDeleteSelectedAccountsV2', deleteSelectedAccounts);
 })();
