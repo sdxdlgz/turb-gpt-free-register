@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -84,6 +85,16 @@ def _enable_twofa_via_roxy(email: str, access_token: str, otp_wait: callable = w
         _submit_email_step(driver, email)
         next_state = _wait_email_submit_next_state(driver, email, timeout=30)
         logger.info("[2FA] 邮箱提交后状态：%s", next_state)
+
+        # 若还没到邮箱验证码页，再等一会儿（部分情况登录页跳转慢/需二次确认）
+        if not _is_email_verification_page(driver):
+            wait_otp_page_end = time.time() + 40
+            while time.time() < wait_otp_page_end:
+                if _is_email_verification_page(driver):
+                    next_state = "email_verification"
+                    break
+                time.sleep(1.5)
+            logger.info("[2FA] 等待邮箱验证码页后状态：%s url=%s", next_state, driver.current_url if hasattr(driver,"current_url") else "?")
 
         otp_after = time.time()
         code = otp_wait(email, after_ts=otp_after)
