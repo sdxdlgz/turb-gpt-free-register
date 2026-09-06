@@ -777,6 +777,23 @@ def _submit_email_form_stable(driver, email: str) -> dict:
         return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
+def _switch_to_newest_window(driver) -> bool:
+    """若 Roxy 打开了新标签页（如跳到 auth.openai.com），切到最新窗口。返回是否切换。"""
+    try:
+        handles = driver.window_handles
+        current = driver.current_window_handle
+        if len(handles) > 1:
+            target = handles[-1]
+            if target != current:
+                driver.switch_to.window(target)
+                time.sleep(0.5)
+                logger.info("%s 检测到窗口数=%s，已切到最新窗口 url=%s", _log_prefix(driver), len(handles), str(getattr(driver, "current_url", "") or "")[:180])
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _submit_email_step(driver, email: str | None = None) -> None:
     # 不再优先走浏览器内 NextAuth fetch：
     # Roxy/Chrome 150 下 execute_async_script + fetch 偶发卡到 script timeout；
@@ -973,6 +990,7 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     cleared_recover_done = False
     expected_email = str(email or "").strip().lower()
     while time.time() < end:
+        _switch_to_newest_window(driver)
         if _has_access_token(driver):
             return "logged_in"
         if _is_login_password_page(driver):
