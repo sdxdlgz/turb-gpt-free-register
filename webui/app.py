@@ -552,6 +552,93 @@ def create_app(auth_code: str | None = None) -> Flask:
             headers={"Content-Disposition": f'attachment; filename="reauth-{_dt.now().strftime("%Y%m%d-%H%M%S")}.txt"'},
         )
 
+    @app.route("/api/accounts/export-full", methods=["GET"])
+    def api_accounts_export_full():
+        """导出全部账号的完整数据（access_token/totp/密码/extra/user/plan/codex 全字段）为 JSON 文件。"""
+        import json as _json
+        from core import db as _db
+        rows = _db._load_accounts()
+        payload = {
+            "app": "turb-gpt-free-register",
+            "kind": "accounts-full",
+            "version": 1,
+            "count": len(rows),
+            "accounts": [dict(r) for r in rows],
+        }
+        text = _json.dumps(payload, ensure_ascii=False, indent=2)
+        from datetime import datetime as _dt
+        return Response(
+            text,
+            mimetype="application/json; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="accounts-full-{_dt.now().strftime("%Y%m%d-%H%M%S")}.json"'},
+        )
+
+    @app.route("/api/accounts/import-full", methods=["POST"])
+    def api_accounts_import_full():
+        """导入完整账号 JSON（WebUI 上传的文件或 JSON body）。
+
+        body: {records:[...], merge:bool} 或 multipart 文件字段 file
+        """
+        import json as _json
+        from core import db as _db
+
+        records = None
+        merge = False
+        # multipart 文件
+        if request.files:
+            up = request.files.get("file")
+            if up:
+                try:
+                    raw = up.read().decode("utf-8", errors="replace")
+                except Exception as exc:
+                    return jsonify({"ok": False, "error": f"读取文件失败: {exc}"}), 400
+                try:
+                    data = _json.loads(raw)
+                except Exception as exc:
+                    return jsonify({"ok": False, "error": f"文件不是合法 JSON: {exc}"}), 400
+                if isinstance(data, dict):
+                    records = data.get("accounts") or data.get("records")
+                elif isinstance(data, list):
+                    records = data
+        if records is None:
+            data = request.get_json(silent=True) or {}
+            recs = data.get("records") or (data.get("accounts") if isinstance(data, dict) else None)
+            if isinstance(recs, list):
+                records = recs
+            merge = bool(data.get("merge", data.get("overwrite", False)))
+        if not isinstance(records, list) or not records:
+            return jsonify({"ok": False, "error": "没有可导入的账号数据"}), 400
+
+        existing = _db._load_accounts()
+        by_email = {(r.get("email") or "").lower(): r for r in existing}
+        added = updated = skipped = 0
+        for rec in records:
+            rec = dict(rec or {})
+            email = (rec.get("email") or "").strip()
+            if not email:
+                skipped += 1
+                continue
+            key = email.lower()
+            if key in by_email:
+                if not merge:
+                    skipped += 1
+                    continue
+                old = by_email[key]
+                for k, v in rec.items():
+                    if k not in ("id", "created_at", "copy_line"):
+                        old[k] = v
+                updated += 1
+            else:
+                row = dict(rec)
+                row.setdefault("id", max((int((r.get("id") or 0)) for r in existing), default=0) + len(existing) + added + 1)
+                row.setdefault("created_at", __import__("datetime").datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
+                existing.append(row)
+                by_email[key] = row
+                added += 1
+        _db._save_accounts(existing)
+        return jsonify({"ok": True, "added": added, "updated": updated, "skipped": skipped,
+                        "message": f"导入完成：新增 {added}、更新 {updated}、跳过 {skipped}"})
+
     @app.post("/api/accounts/<int:acc_id>/archive")
     def api_account_archive(acc_id: int):
         """归档/取消归档一个账号。Body {archived: true|false}。"""
