@@ -12,6 +12,7 @@ from config import email as _email_cfg
 from core import db
 from core.account_export import setup_2fa
 from core.session import BrowserSession
+from core.email_provider import wait_for_otp
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,65 @@ def _append_log(email: str, line: str, *, clear: bool = False) -> None:
         f.write(f"{stamp} [INFO] {line}\n")
 
 
+def _enable_twofa_via_roxy(email: str, access_token: str, otp_wait: callable = wait_for_otp) -> str:
+    """用 Roxy 真实浏览器给已有账号开 2FA（页面内 enroll，避免 curl 被 Cloudflare 重置）。
+
+    流程：开 Roxy → chatgpt 登录（邮箱 OTP）→ 页面内 mfa/enroll + activate。
+    返回 totp_secret；失败抛异常。
+    """
+    logger.info("[2FA] 走 Roxy 浏览器路径：email=%s", email)
+    from core.roxybrowser_client import RoxyBrowserClient
+    from core.roxy_registration import (
+        _build_driver, _type_email_address, _submit_email_step, _wait_email_submit_next_state,
+        _type_otp, _clear_otp_inputs, _click_continue, _wait_after_email_otp_submit,
+        _fetch_chatgpt_session, _setup_2fa_selenium,
+    )
+    from core.roxy_codex_oauth import _fill_mfa_challenge_if_present
+
+    client = RoxyBrowserClient()
+    opened = client.open_profile()
+    driver = None
+    try:
+        driver = _build_driver(opened)
+        logger.info("[2FA] 登录 chatgpt.com：email=%s profile=%s", email, opened.profile_id)
+        driver.get("https://chatgpt.com/auth/login")
+        _type_email_address(driver, email)
+        _submit_email_step(driver, email)
+        next_state = _wait_email_submit_next_state(driver, email, timeout=30)
+        logger.info("[2FA] 邮箱提交后状态：%s", next_state)
+
+        otp_after = time.time()
+        code = otp_wait(email, after_ts=otp_after)
+        logger.info("[2FA] 收到邮箱 OTP：%s", code)
+        _clear_otp_inputs(driver)
+        _type_otp(driver, code)
+        _click_continue(driver)
+        outcome = _wait_after_email_otp_submit(driver, timeout=45)
+        logger.info("[2FA] OTP 提交后状态：%s", outcome)
+
+        # 已有账号可能有 2FA 之外的 mfa（理论上没有），兜底处理
+        _fill_mfa_challenge_if_present(driver, email, timeout=15)
+
+        session = _fetch_chatgpt_session(driver, timeout=60)
+        fresh_token = session.get("accessToken") or access_token
+        logger.info("[2FA] 已登录，开始页面内 enroll...")
+        secret = _setup_2fa_selenium(driver, fresh_token, email=email)
+        if not secret:
+            raise RuntimeError("页面内 enroll 失败（未得到 TOTP secret）")
+        logger.info("[2FA] 2FA 设置完成：email=%s secret=%s...", email, secret[:4])
+        return secret
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        try:
+            client.cleanup_profile(opened)
+        except Exception:
+            pass
+
+
 def _run_twofa(*, account_id: int, email: str, access_token: str, proxy: str | None, trigger: str) -> dict:
     fh: logging.FileHandler | None = None
     root_logger = logging.getLogger()
@@ -75,6 +135,19 @@ def _run_twofa(*, account_id: int, email: str, access_token: str, proxy: str | N
         fh.addFilter(lambda record: record.threadName == thread_name)
         root_logger.addHandler(fh)
         logger.info("[2FA] 开始后台设置：email=%s trigger=%s", email, trigger)
+        # 优先用 Roxy 真实浏览器（页面内 enroll），避免 curl 协议被 chatgpt Cloudflare 重置
+        try:
+            secret = _enable_twofa_via_roxy(email, access_token, otp_wait=wait_for_otp)
+            if secret:
+                db.update_account_totp_secret(
+                    account_id,
+                    {"ok": True, "status": "success", "totp_secret": secret, "message": "2FA 设置完成（浏览器）"},
+                )
+                _append_log(email, f"[2FA] 完成：secret={secret[:4]}...{secret[-4:]}")
+                logger.info("[2FA] 完成：email=%s secret=%s...%s", email, secret[:4], secret[-4:])
+                return {"ok": True, "status": "success", "totp_secret": secret, "message": "2FA 设置完成"}
+        except Exception as exc:
+            logger.warning("[2FA] Roxy 浏览器路径失败，回退 curl 协议：%s", str(exc)[:200])
         real_proxy = _normalize_proxy(proxy)
         session = BrowserSession(proxy=real_proxy, fingerprint_seed=f"account:{email.lower()}")
         _append_log(email, f"[2FA] 会话创建完成：proxy={session.proxy or 'direct'} device_id={session.device_id}")
