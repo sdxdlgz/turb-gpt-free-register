@@ -159,8 +159,12 @@ def _smsbower_country_id_map(http: CurlSession) -> dict[str, str]:
     return mapping
 
 
-def _smsbower_pick_cheapest_gold(http: CurlSession) -> tuple[str, str, float] | None:
-    """在 SMSBower gold 级别号码里，按价格上限选最便宜的 (country_id, provider_ids, price)。"""
+def _smsbower_pick_cheapest_gold(http: CurlSession) -> list[tuple[str, str, float]]:
+    """在 SMSBower gold 级别号码里，按价格上限选最便宜的一批候选（价格升序）。
+
+    返回 [(country_id, provider_ids, price), ...]；为空则抛 SmsNoNumbersError。
+    调用方逐个尝试（某供应商没货就换下一个 / 去掉供应商限制），避免“单个没货即失败”。
+    """
     top = _request_grizzly_json(
         http, {"action": "getTopCountriesByService", "service": _cfg.SMS_SERVICE}
     )
@@ -174,7 +178,8 @@ def _smsbower_pick_cheapest_gold(http: CurlSession) -> tuple[str, str, float] | 
     except (TypeError, ValueError):
         max_price = None
 
-    best: tuple[str, str, float] | None = None
+    candidates: list[tuple[str, str, float]] = []
+    seen = set()
     for cname, providers in top.items():
         if not isinstance(cname, str) or not isinstance(providers, dict):
             continue
@@ -198,19 +203,24 @@ def _smsbower_pick_cheapest_gold(http: CurlSession) -> tuple[str, str, float] | 
                 continue
             if max_price is not None and price > max_price:
                 continue
-            if best is None or price < best[2]:
-                best = (cid, str(pid), price)
+            key = (cid, str(pid))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append((cid, str(pid), price))
 
-    if best is None:
+    # 价格升序
+    candidates.sort(key=lambda x: x[2])
+    if not candidates:
         raise SmsNoNumbersError(
             "自动选号：当前服务没有符合价格上限的 gold 号码"
             + (f"（maxPrice={max_price}）" if max_price is not None else "")
         )
     logger.info(
-        "[SMS] 自动选号（gold 最低价）：country_id=%s provider_id=%s price=%.4f",
-        best[0], best[1], best[2],
+        "[SMS] 自动选号（gold 候选）：共 %s 个，最便宜 country_id=%s provider_id=%s price=%.4f",
+        len(candidates), candidates[0][0], candidates[0][1], candidates[0][2],
     )
-    return best
+    return candidates
 
 
 def _l_url(path: str) -> str:
@@ -501,32 +511,47 @@ def acquire_number(
         if country_val.lower() in ("auto", "random", "cheapest", "*"):
             auto_country = True
 
-        params: dict = {"action": "getNumber", "service": service or _cfg.SMS_SERVICE}
-        provider_ids = ""
-        if auto_country:
-            # 随机国家 + gold 级别 + 价格上限里选最低价
-            picked = _smsbower_pick_cheapest_gold(http)
-            if picked:
-                params["country"] = picked[0]
-                provider_ids = picked[1]
-                params["providerIds"] = provider_ids
-        else:
-            params["country"] = country_val or _cfg.SMS_COUNTRY or ""
+        base_params: dict = {"action": "getNumber", "service": service or _cfg.SMS_SERVICE}
         if _cfg.SMS_MAX_PRICE:
-            params["maxPrice"] = _cfg.SMS_MAX_PRICE
+            base_params["maxPrice"] = _cfg.SMS_MAX_PRICE
 
-        text = _request_grizzly(http, params)
-        # 成功格式：ACCESS_NUMBER:激活ID:号码
-        if not text.startswith("ACCESS_NUMBER:"):
-            raise SmsProviderError(f"getNumber 非预期响应：{text[:200]}")
-        parts = text.split(":")
-        if len(parts) < 3:
-            raise SmsProviderError(f"getNumber 响应格式异常：{text[:200]}")
-        activation_id = parts[1].strip()
-        phone = parts[2].strip()
-        _ACQUIRED_AT[activation_id] = time.time()
-        logger.info(f"[SMS] 取号成功：activation_id={activation_id}, phone=+{phone}")
-        return activation_id, phone
+        def _try_getnumber(params: dict) -> tuple[str, str]:
+            text = _request_grizzly(http, params)
+            # 成功格式：ACCESS_NUMBER:激活ID:号码
+            if not text.startswith("ACCESS_NUMBER:"):
+                raise SmsProviderError(f"getNumber 非预期响应：{text[:200]}")
+            parts = text.split(":")
+            if len(parts) < 3:
+                raise SmsProviderError(f"getNumber 响应格式异常：{text[:200]}")
+            activation_id = parts[1].strip()
+            phone = parts[2].strip()
+            _ACQUIRED_AT[activation_id] = time.time()
+            logger.info(f"[SMS] 取号成功：activation_id={activation_id}, phone=+{phone}")
+            return activation_id, phone
+
+        if auto_country:
+            # 自动选号：候选按价格升序，逐个试；带供应商没货则同国去供应商再试。
+            candidates = _smsbower_pick_cheapest_gold(http)
+            last_no_numbers: SmsNoNumbersError | None = None
+            for cid, pid, price in candidates:
+                params = dict(base_params, country=cid, providerIds=pid)
+                try:
+                    return _try_getnumber(params)
+                except SmsNoNumbersError as exc:
+                    last_no_numbers = exc
+                    logger.info("[SMS] 自动选号候选无货(带供应商)：country=%s provider=%s price=%.4f，尝试同国去掉供应商", cid, pid, price)
+                    # 同国去掉 providerIds，可能其它供应商有号
+                    try:
+                        return _try_getnumber(dict(base_params, country=cid))
+                    except SmsNoNumbersError:
+                        logger.info("[SMS] 自动选号同国也无货，换下一个候选：country=%s provider=%s", cid, pid)
+                        continue
+            if last_no_numbers is not None:
+                raise last_no_numbers
+            raise SmsNoNumbersError("自动选号：所有候选 gold 号码均无货")
+
+        params = dict(base_params, country=country_val or _cfg.SMS_COUNTRY or "")
+        return _try_getnumber(params)
     finally:
         if own_http:
             http.close()

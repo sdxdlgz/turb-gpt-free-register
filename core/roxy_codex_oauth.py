@@ -275,9 +275,20 @@ def _is_mfa_challenge_page(driver) -> bool:
         return False
 
 
-def _fill_mfa_challenge_if_present(driver, email: str, timeout: int = 15) -> bool:
-    """如果当前进入 MFA challenge 页面，自动填入账号 TOTP 并提交。"""
-    code = _account_totp_code_for_email(email)
+def _fill_mfa_challenge_if_present(driver, email: str, totp_secret: str | None = None, timeout: int = 15) -> bool:
+    """如果当前进入 MFA challenge 页面，自动填入账号 TOTP 并提交。
+
+    totp_secret 优先用调用方传入（注册刚开完 2FA、账号尚未入库时）；否则回退 DB 读取。
+    """
+    code = str(totp_secret or "").strip()
+    if code:
+        try:
+            import pyotp
+            code = pyotp.TOTP(code).now()
+        except Exception:
+            code = ""
+    if not code:
+        code = _account_totp_code_for_email(email)
     if not code:
         return False
     end = time.time() + timeout
@@ -362,7 +373,7 @@ def _fill_login_password_if_present(driver, email: str, timeout: int = 18) -> st
         wait_end = time.time() + 12
         while time.time() < wait_end:
             if _is_mfa_challenge_page(driver):
-                _fill_mfa_challenge_if_present(driver, email, timeout=15)
+                _fill_mfa_challenge_if_present(driver, email, totp_secret=totp_secret, timeout=15)
                 return "next_step"
             if _is_email_verification_page(driver):
                 return "email_otp"
@@ -373,7 +384,7 @@ def _fill_login_password_if_present(driver, email: str, timeout: int = 18) -> st
     return None
 
 
-def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None:
+def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str, totp_secret: str | None = None) -> None:
     otp_after_ts = time.time()
     logger.info("[Codex][Browser] 打开授权地址")
     logger.info("[Codex][Browser] 完整授权地址: %s", auth_url)
@@ -393,7 +404,7 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
         pw_result = _fill_login_password_if_present(driver, email, timeout=18)
         if pw_result == "next_step":
             if _is_mfa_challenge_page(driver):
-                _fill_mfa_challenge_if_present(driver, email, timeout=15)
+                _fill_mfa_challenge_if_present(driver, email, totp_secret=totp_secret, timeout=15)
             logger.info("[Codex][Browser] 账号已用密码完成登录，直接进入后续步骤")
             return
         if pw_result == "email_otp":
@@ -426,7 +437,7 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
             pw_result = _fill_login_password_if_present(driver, email, timeout=12)
             if pw_result == "next_step":
                 if _is_mfa_challenge_page(driver):
-                    _fill_mfa_challenge_if_present(driver, email, timeout=15)
+                    _fill_mfa_challenge_if_present(driver, email, totp_secret=totp_secret, timeout=15)
                 logger.info("[Codex][Browser] 重新提交邮箱后已用密码完成登录，进入后续步骤")
                 return
             if pw_result != "email_otp":
@@ -484,7 +495,7 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
         outcome = _wait_after_email_otp_submit(driver, timeout=45)
         logger.info("[Codex][Browser] 邮箱 OTP 提交后状态：%s", outcome)
         if _is_mfa_challenge_page(driver):
-            _fill_mfa_challenge_if_present(driver, email, timeout=15)
+            _fill_mfa_challenge_if_present(driver, email, totp_secret=totp_secret, timeout=15)
             return
         if outcome == "accepted":
             return
@@ -1393,11 +1404,13 @@ def _run_roxy_codex_oauth_once(
     existing_opened=None,
     reuse_existing_profile: bool = False,
     clear_existing_state: bool = True,
+    totp_secret: str | None = None,
 ) -> dict:
     """指纹浏览器 Codex OAuth 入口。
 
     existing_driver/existing_opened 用于“注册成功后立刻跑 Codex”：
     复用注册时的 Roxy 窗口，不新建环境，只清理浏览器状态后开始授权。
+    totp_secret: 账号 2FA(TOTP) secret（注册刚开完 2FA 尚未入库时优先用）。
     """
     from core import codex_oauth as proto
 
@@ -1442,7 +1455,7 @@ def _run_roxy_codex_oauth_once(
         if reuse_existing_profile and clear_existing_state:
             clear_roxy_browser_auth_state(driver)
 
-        _fill_email_and_otp(driver, email, otp_provider, auth_url)
+        _fill_email_and_otp(driver, email, otp_provider, auth_url, totp_secret=totp_secret)
         human_delay("api")
         logger.info("[Codex][Browser] 检查是否需要手机号验证")
         _do_phone_verification_if_present(driver)
@@ -1545,6 +1558,7 @@ def run_roxy_codex_oauth(
     existing_opened=None,
     reuse_existing_profile: bool = False,
     clear_existing_state: bool = True,
+    totp_secret: str | None = None,
 ) -> dict:
     """指纹浏览器 Codex OAuth 入口；CPA callback 409 timeout 时重新开启一轮授权。"""
     from core import codex_oauth as proto
@@ -1566,6 +1580,7 @@ def run_roxy_codex_oauth(
             existing_opened=existing_opened,
             reuse_existing_profile=reuse_existing_profile,
             clear_existing_state=clear_existing_state,
+            totp_secret=totp_secret,
         )
         last_result = result
         if result.get("ok"):

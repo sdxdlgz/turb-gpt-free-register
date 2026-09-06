@@ -1545,6 +1545,94 @@ def _generate_roxy_password() -> str:
     return ''.join(chars)
 
 
+def _setup_2fa_selenium(driver, access_token: str, email: str = "") -> str:
+    """Roxy 注册路径自动启用 2FA(TOTP)：在已登录页面内 enroll + activate（浏览器内，不过 curl）。
+
+    失败返回空字符串，不影响注册结果。
+    """
+    import pyotp
+
+    enroll_script = r"""
+      var accessToken = arguments[0];
+      var callback = arguments[arguments.length - 1];
+      (async () => {
+        let deviceId = '';
+        try {
+          const m = document.cookie.match(/(?:^|;\s*)oai-did=([^;]+)/);
+          if (m && m[1]) deviceId = m[1];
+          if (!deviceId) {
+            for (const k of Object.keys(localStorage)) {
+              if (/oai|did|device/i.test(k)) {
+                const v = localStorage.getItem(k);
+                if (v && v.length >= 8) { deviceId = v; break; }
+              }
+            }
+          }
+        } catch (e) {}
+        const h = {'accept':'application/json','content-type':'application/json','authorization':'Bearer '+accessToken};
+        if (deviceId) h['oai-device-id'] = deviceId;
+        try {
+          const r = await fetch('https://chatgpt.com/backend-api/accounts/mfa/enroll', {
+            method:'POST', headers:h, body:JSON.stringify({factor_type:'totp'}), credentials:'include'
+          });
+          const j = await r.json().catch(()=>({}));
+          if (!r.ok || !j.secret || !j.session_id) { callback({ok:false, status:r.status, data:JSON.stringify(j).slice(0,200)}); return; }
+          callback({ok:true, secret:j.secret, session_id:j.session_id});
+        } catch (e) {
+          callback({ok:false, error:String(e).slice(0,200)});
+        }
+      })();
+    """
+    try:
+        res = driver.execute_async_script(enroll_script, access_token)
+    except Exception as exc:
+        logger.warning("[Roxy注册][2FA] enroll 脚本执行失败：%s", str(exc)[:160])
+        return ""
+    if not isinstance(res, dict) or not res.get("ok"):
+        logger.warning("[Roxy注册][2FA] enroll 失败：%s", str(res if isinstance(res, dict) else res)[:240])
+        return ""
+    secret = str(res.get("secret") or "").strip()
+    session_id = str(res.get("session_id") or "").strip()
+    if not secret or not session_id:
+        return ""
+
+    code = pyotp.TOTP(secret).now()
+    activate_script = r"""
+      var accessToken = arguments[0];
+      var code = arguments[1];
+      var sessionId = arguments[2];
+      var callback = arguments[arguments.length - 1];
+      (async () => {
+        let deviceId = '';
+        try {
+          const m = document.cookie.match(/(?:^|;\s*)oai-did=([^;]+)/);
+          if (m && m[1]) deviceId = m[1];
+        } catch (e) {}
+        const h = {'accept':'application/json','content-type':'application/json','authorization':'Bearer '+accessToken};
+        if (deviceId) h['oai-device-id'] = deviceId;
+        try {
+          const r = await fetch('https://chatgpt.com/backend-api/accounts/mfa/user/activate_enrollment', {
+            method:'POST', headers:h, body:JSON.stringify({code:code, factor_type:'totp', session_id:sessionId}), credentials:'include'
+          });
+          const j = await r.json().catch(()=>({}));
+          callback({ok: r.ok, status:r.status, data:JSON.stringify(j).slice(0,200)});
+        } catch (e) {
+          callback({ok:false, error:String(e).slice(0,200)});
+        }
+      })();
+    """
+    try:
+        act = driver.execute_async_script(activate_script, access_token, code, session_id)
+    except Exception as exc:
+        logger.warning("[Roxy注册][2FA] activate 脚本执行失败：%s", str(exc)[:160])
+        return ""
+    if isinstance(act, dict) and act.get("ok"):
+        logger.info("[Roxy注册][2FA] 2FA(TOTP) 已启用，email=%s secret=%s...%s", email or "?", secret[:4], secret[-4:])
+        return secret
+    logger.warning("[Roxy注册][2FA] activate 失败：%s", str(act if isinstance(act, dict) else act)[:240])
+    return ""
+
+
 def _registration_password() -> str:
     try:
         from config import register as _register_cfg
@@ -2288,8 +2376,15 @@ def run_roxy_registration(
         _check_manual_stop()
 
         if _twofa_cfg.ENABLE_2FA:
-            logger.warning("[Roxy注册] 当前 Roxy 自动化路径暂不执行 2FA 设置，已跳过")
-        totp_secret = None
+            try:
+                totp_secret = _setup_2fa_selenium(driver, access_token, email=email)
+                if not totp_secret:
+                    logger.warning("[Roxy注册] 2FA 设置失败/被跳过（不影响注册）：%s", email)
+            except Exception as exc:
+                logger.warning("[Roxy注册] 2FA 设置异常（不影响注册）：%s", str(exc)[:160])
+                totp_secret = None
+        else:
+            totp_secret = None
 
         codex_result = {
             "status": "skipped",
@@ -2310,6 +2405,7 @@ def run_roxy_registration(
                     existing_driver=driver,
                     existing_opened=opened,
                     force=True,
+                    totp_secret=totp_secret,
                     clear_existing_state=True,
                 )
                 _traffic_checkpoint()
