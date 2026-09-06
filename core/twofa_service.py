@@ -69,8 +69,8 @@ def _enable_twofa_via_roxy(email: str, access_token: str, otp_wait: callable = w
     from core.roxybrowser_client import RoxyBrowserClient
     from core.roxy_registration import (
         _build_driver, _type_email_address, _submit_email_step, _wait_email_submit_next_state,
-        _type_otp, _clear_otp_inputs, _click_continue, _wait_after_email_otp_submit,
-        _fetch_chatgpt_session, _setup_2fa_selenium,
+        _is_email_verification_page, _type_otp, _clear_otp_inputs, _click_continue,
+        _wait_after_email_otp_submit, _fetch_chatgpt_session, _setup_2fa_selenium,
     )
     from core.roxy_codex_oauth import _fill_mfa_challenge_if_present
 
