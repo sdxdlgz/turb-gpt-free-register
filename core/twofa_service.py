@@ -69,41 +69,100 @@ def _enable_twofa_via_roxy(email: str, access_token: str, otp_wait: callable = w
     from core.roxybrowser_client import RoxyBrowserClient
     from core.roxy_registration import (
         _build_driver, _type_email_address, _submit_email_step, _wait_email_submit_next_state,
-        _is_email_verification_page, _type_otp, _clear_otp_inputs, _click_continue,
+        _is_email_verification_page, _is_login_password_page,
+        _type_otp, _clear_otp_inputs, _click_continue,
         _wait_after_email_otp_submit, _fetch_chatgpt_session, _setup_2fa_selenium,
+        _type_any, _click_any,
     )
     from core.roxy_codex_oauth import _fill_mfa_challenge_if_present
+    from core import db as _db
+
+    # 读账号保存的密码（若有）
+    try:
+        _acc = _db.get_account_by_email(email) or {}
+        _extra = _acc.get("extra_json")
+        if isinstance(_extra, str) and _extra.strip():
+            import json as _json
+            _extra = _json.loads(_extra)
+        _password = str((( _extra or {}).get("registration_password") if isinstance(_extra, dict) else "") or (_acc.get("password") or "") or "").strip()
+    except Exception:
+        _password = ""
 
     client = RoxyBrowserClient()
     opened = client.open_profile()
     driver = None
     try:
         driver = _build_driver(opened)
-        logger.info("[2FA] 登录 chatgpt.com：email=%s profile=%s", email, opened.profile_id)
-        driver.get("https://chatgpt.com/auth/login")
-        _type_email_address(driver, email)
-        _submit_email_step(driver, email)
-        next_state = _wait_email_submit_next_state(driver, email, timeout=30)
-        logger.info("[2FA] 邮箱提交后状态：%s", next_state)
+        logged_in = False
 
-        # 若还没到邮箱验证码页，再等一会儿（部分情况登录页跳转慢/需二次确认）
-        if not _is_email_verification_page(driver):
-            wait_otp_page_end = time.time() + 40
-            while time.time() < wait_otp_page_end:
-                if _is_email_verification_page(driver):
-                    next_state = "email_verification"
-                    break
-                time.sleep(1.5)
-            logger.info("[2FA] 等待邮箱验证码页后状态：%s url=%s", next_state, driver.current_url if hasattr(driver,"current_url") else "?")
+        # 优先直接身份话：如果账号有密码，直接去 auth.openai.com 用 邮箱+密码 登录（不依赖收 OTP）
+        if _password:
+            try:
+                logger.info("[2FA] 用邮箱+密码登录（auth.openai.com）：email=%s profile=%s", email, opened.profile_id)
+                driver.get("https://auth.openai.com/log-in/password")
+                time.sleep(2)
+                _type_email_address(driver, email)
+                time.sleep(0.5)
+                _type_any(driver,
+                          ["input[type='password']", "input[name='password']", "input[autocomplete='current-password']", "input[type='password'] input"],
+                          _password, clear=True, timeout=8)
+                _click_any(driver, ["button[type='submit']", "button:has-text('Continue')",
+                                    "button:has-text('Continue with password')", "button:has-text('Log in')",
+                                    "button:has-text('登录')", "form button"], timeout=8)
+                # 等进入 chatgpt
+                ok_end = time.time() + 40
+                while time.time() < ok_end:
+                    try:
+                        cur = (driver.current_url or "").lower()
+                    except Exception:
+                        cur = ""
+                    if "chatgpt.com" in cur and "login" not in cur:
+                        logged_in = True
+                        break
+                    if _is_email_verification_page(driver):
+                        break
+                    if _is_login_password_page(driver):
+                        _type_any(driver, ["input[type='password']", "input[name='password']", "input[autocomplete='current-password']"], _password, clear=True, timeout=5)
+                        _click_any(driver, ["button[type='submit']", "button:has-text('Continue')", "form button"], timeout=5)
+                        time.sleep(1)
+                    time.sleep(1.5)
+                logger.info("[2FA] 密码登录结果：logged_in=%s url=%s", logged_in, driver.current_url if hasattr(driver,"current_url") else "?")
+            except Exception as exc:
+                logger.warning("[2FA] 密码登录尝试失败，回退邮箱OTP途径：%s", str(exc)[:160])
 
-        otp_after = time.time()
-        code = otp_wait(email, after_ts=otp_after)
-        logger.info("[2FA] 收到邮箱 OTP：%s", code)
-        _clear_otp_inputs(driver)
-        _type_otp(driver, code)
-        _click_continue(driver)
-        outcome = _wait_after_email_otp_submit(driver, timeout=45)
-        logger.info("[2FA] OTP 提交后状态：%s", outcome)
+        # 若上面没搞定，走邮件OTP登录
+        if not logged_in:
+            logger.info("[2FA] 登录 chatgpt.com（邮箱OTP途径）：email=%s profile=%s", email, opened.profile_id)
+            driver.get("https://chatgpt.com/auth/login")
+            _type_email_address(driver, email)
+            _submit_email_step(driver, email)
+            next_state = _wait_email_submit_next_state(driver, email, timeout=30)
+            logger.info("[2FA] 邮箱提交后状态：%s", next_state)
+
+            if not _is_email_verification_page(driver):
+                wait_otp_page_end = time.time() + 40
+                while time.time() < wait_otp_page_end:
+                    if _is_email_verification_page(driver):
+                        next_state = "email_verification"
+                        break
+                    time.sleep(1.5)
+                logger.info("[2FA] 等待邮箱验证码页后状态：%s", next_state)
+
+            if _is_email_verification_page(driver):
+                otp_after = time.time()
+                code = otp_wait(email, after_ts=otp_after)
+                logger.info("[2FA] 收到邮箱 OTP：%s", code)
+                _clear_otp_inputs(driver)
+                _type_otp(driver, code)
+                _click_continue(driver)
+                outcome = _wait_after_email_otp_submit(driver, timeout=45)
+                logger.info("[2FA] OTP 提交后状态：%s", outcome)
+            else:
+                # 若始终未进验证码页但有密码页，再补一次密码
+                if _is_login_password_page(driver) and _password:
+                    _type_any(driver, ["input[type='password']", "input[name='password']", "input[autocomplete='current-password']"], _password, clear=True, timeout=6)
+                    _click_any(driver, ["button[type='submit']", "button:has-text('Continue')", "form button"], timeout=6)
+                    time.sleep(2)
 
         # 已有账号可能有 2FA 之外的 mfa（理论上没有），兜底处理
         _fill_mfa_challenge_if_present(driver, email, timeout=15)
